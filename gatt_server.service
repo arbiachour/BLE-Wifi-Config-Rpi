@@ -1,0 +1,13 @@
+[Unit]
+Description=BLE Characteristic Trigger Service
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /home/pi/ble/ble_characteristic_trigger.py
+WorkingDirectory=/home/pi/ble
+Restart=always
+User=your-pi
+Group=pi
+
+[Install]
+WantedBy=multi-user.target
