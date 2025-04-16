@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 logHandler = logging.StreamHandler()
-filelogHandler = logging.FileHandler("dewarmtewpable.log")
+filelogHandler = logging.FileHandler("able.log")
 
 logHandler.setFormatter(formatter)
 filelogHandler.setFormatter(formatter)

@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
 logHandler = logging.StreamHandler()
-filelogHandler = logging.FileHandler("dewarmteble.log")
+filelogHandler = logging.FileHandler("ble.log")
 
 logHandler.setFormatter(formatter)
 filelogHandler.setFormatter(formatter)
@@ -31,7 +31,7 @@ bus = None
 device_obj = None
 dev_path = None
 
-AGENT_PATH = "/org/bluez/dewarmteble/agent"
+AGENT_PATH = "/org/bluez/ble/agent"
 
 
 BLUEZ_SERVICE_NAME = 'org.bluez'
@@ -113,7 +113,7 @@ class Service(dbus.service.Object):
     """
         GattService1 interface implementation
     """
-    PATHBASE = '/org/bluez/dewarmteble/service'
+    PATHBASE = '/org/bluez/ble/service'
 
     def __init__(self, bus, index, uuid, primary):
         self.path = self.PATHBASE + str(index)
@@ -277,7 +277,7 @@ class Advertisement(dbus.service.Object):
     """
     GattAdvertisement1 interface implementation
     """
-    PATH_BASE = '/org/bluez/dewarmteble/advertisement'
+    PATH_BASE = '/org/bluez/ble/advertisement'
 
     def __init__(self, bus, index, advertising_type):
         self.path = self.PATH_BASE + str(index)

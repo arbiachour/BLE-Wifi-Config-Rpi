@@ -18,8 +18,8 @@ else
 fi
 
 # Create log files
-LOG_FILE1="/home/pi/dewarmtewpable.log"
-LOG_FILE2="/home/pi/dewarmteble.log"
+LOG_FILE1="/home/pi/wpable.log"
+LOG_FILE2="/home/pi/ble.log"
 
 touch "$LOG_FILE1" "$LOG_FILE2"
 echo "Created log files: $LOG_FILE1, $LOG_FILE2"
