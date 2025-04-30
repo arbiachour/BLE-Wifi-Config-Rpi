@@ -1,0 +1,15 @@
+[Unit]
+Description=BLE Wi-Fi Trigger Button Service
+After=network.target bluetooth.target
+Requires=bluetooth.target
+
+[Service]
+User=pi
+WorkingDirectory=/home/pi/BLE-Wifi-Config-Rpi
+ExecStart=/usr/bin/python3 /home/pi/BLE-Wifi-Config-Rpi/ble_characteristic_trigger.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

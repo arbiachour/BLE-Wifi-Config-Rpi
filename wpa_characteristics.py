@@ -1,236 +1,213 @@
-import os
-import subprocess
 import json
+import sys
+import array
+import subprocess
 import dbus
-import dbus.mainloop.glib
+import socket
+import time
 from gi.repository import GLib
-import logging
-from gatt_server import ( Service, Characteristic, CharacteristicUserDescriptionDescriptor, Advertisement, Application, Agent, 
-                         ADAPTER_IFACE, BLUEZ_SERVICE_NAME, GATT_MANAGER_IFACE, LE_ADVERTISING_MANAGER_IFACE, AGENT_PATH, DBUS_PROP_IFACE,GATT_CHRC_IFACE,
-                         find_adapter, register_ad_cb,register_ad_error_cb, register_app_cb, register_app_error_cb)
-
-
+from gatt_server import (
+    GATT_CHARACTERISTIC_IFACE, CUDDiscriptor, Characteristic, InvalidValueLengthException, 
+    logger, InvalidArgsException, NotSupportedException, Advertisement, Service, Application, Agent, 
+    AGENT_PATH, BLUEZ_SERVICE_NAME
+)
 
 mainloop = GLib.MainLoop()
-logger = logging.getLogger(__name__)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-logHandler = logging.StreamHandler()
-filelogHandler = logging.FileHandler("able.log")
-
-logHandler.setFormatter(formatter)
-filelogHandler.setFormatter(formatter)
-
-logger.addHandler(logHandler)
-logger.addHandler(filelogHandler)
-
-logger.setLevel(logging.INFO)
-
-WPA_SUPPLICANT_PATH = '/etc/wpa_supplicant/wpa_supplicant.conf'
-WPA_COUNTRY_DEFAULT = 'NL'
-WPA_SSID_DEFAULT = ''
-WPA_SCAN_SSID_DEFAULT = 1
-WPA_PSK_DEFAULT = ''
-WPA_KEY_MGMT_DEFAULT = 'WPA-PSK'
 
 
-def parser(file_path):
-    allvars = dict()
-    with open(file_path, 'r') as f :
-        for line in f:
-            name, value = line.partition("=")[::2]
-            allvars[name.lower().strip()] = value 
+class WiFiManager:
+    def __init__(self, interface="wlan0"):
+        self.interface = interface
+        self.ssid = None
+        self.psk = None
 
-    return allvars
+    def set_credentials(self, ssid, psk):
+        if len(ssid) > 32:
+            raise ValueError("SSID must be 32 characters or less")
+        if not (8 <= len(psk) <= 63):
+            raise ValueError("PSK must be between 8 and 63 characters")
+        self.ssid = ssid
+        self.psk = psk
+        logger.info(f"WiFi credentials set: SSID={self.ssid}")
 
-class WPASupplicant:
-    def __init__(self, file_path = WPA_SUPPLICANT_PATH):
-        self.file_path = file_path
-        self.params =  {
-            'country': WPA_COUNTRY_DEFAULT,
-            'ssid': WPA_SSID_DEFAULT,
-            'scan_ssid': WPA_SCAN_SSID_DEFAULT,
-            'psk': WPA_PSK_DEFAULT,
-            'key_mgmt': WPA_KEY_MGMT_DEFAULT
-        }
+    def connect(self, retries=3, delay=5):
+        if not self.ssid or not self.psk:
+            raise ValueError("SSID and PSK must be set before connecting")
 
-    def read(self):
-        args = parser(self.file_path)
-        for key, value in args.items():
-            if key in self.params:
-                self.params[key] = value
-        return
+        last_error = "Unknown error"
+        for attempt in range(1, retries + 1):
+            cmd = [
+                "nmcli", "device", "wifi", "connect", self.ssid,
+                "password", self.psk,
+                "ifname", self.interface
+            ]
 
-    def write(self):
-        with open(self.file_path, 'w') as f:
-            f.write('ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev\n')
-            f.write('update_config=1\n')
-            f.write(f"country={self.params['country']}\n")
-            f.write('network={\n')
-            f.write(f"ssid=\"{self.params['ssid']}\"\n")
-            f.write(f"scan_ssid={self.params['scan_ssid']}\n")
-            f.write(f"psk=\"{self.params['psk']}\"\n")
-            f.write(f"key_mgmt={self.params['key_mgmt']}\n")
-            f.write('}')
-        return
-    
-    def restart_wlan_interface(self):
-        self.restart_process = subprocess.Popen(["sudo","systemctl","restart","wpa_supplicant"])
+            logger.info(f"Attempt {attempt}: Running command: {' '.join(cmd)}")
+            process = subprocess.run(cmd, capture_output=True, text=True)
 
-class WPAManageService(Service):
-    """
-    Service to manage the local WLAN adapter.
-    Allows a user to configure the WLAN wpa_applicant service
-    """
+            if process.returncode == 0:
+                logger.info(f"Connected to Wi-Fi network {self.ssid}: {process.stdout}")
+                return {"success": True, "message": "Connected successfully"}
 
-    WLANMANAGE_SVC_UUID = "54321d67-d578-4874-6e86-7d024ee09ba7"
+            error_msg = process.stderr.strip()
+            logger.warning(f"Failed to connect (attempt {attempt}): {error_msg}")
+            last_error = error_msg
 
-    def __init__(self, bus, index):
-        Service.__init__(self, bus, index, self.WLANMANAGE_SVC_UUID, True)
-        self.add_characteristic(WPAConfigureCharacteristic(bus, 0, self))
-        
+            if attempt < retries:
+                time.sleep(delay)
+
+        logger.error(f"All {retries} connection attempts failed.")
+        return {"success": False, "message": last_error}
+
+    def scan_wifi_networks(self):
+        try:
+            output = subprocess.check_output(
+                ['nmcli', '-t', '-f', 'SSID', 'device', 'wifi'],
+                text=True
+            )
+            ssids = list({line.strip() for line in output.splitlines() if line.strip()})
+            logger.info(f"Available Wi-Fi networks: {ssids}")
+            return ssids
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Error scanning Wi-Fi networks: {e}")
+            return []
 
 
-class WPAConfigureCharacteristic(Characteristic):
-    uuid = "4321f8d2-9f96-4f58-a53d-fc7550e7c15e"
-    description = b"Configure WLAN interface {read:cur_config, write:new_config}"
+class WPACharacteristic(Characteristic):
+    WPA_CHAR_UUID = '00001801-0000-1000-6000-00805f9b34fb'
+    WPA_CHAR_FLAGS = ['read', 'write', 'notify', 'secure-read', 'secure-write']
 
     def __init__(self, bus, index, service):
-        super().__init__(bus, index, self.uuid, ["read","write", "notify"], service)
+        super().__init__(bus, index, self.WPA_CHAR_UUID, self.WPA_CHAR_FLAGS, service)
+        self.wifi_manager = WiFiManager()
         self.notifying = False
-        self.add_descriptor(CharacteristicUserDescriptionDescriptor(bus, 1,self))
-        self.wpa = WPASupplicant()
+        self.add_descriptor(CUDDiscriptor(bus, 1, self))
+        self.ip = self.get_local_ip()
+        msg = json.dumps({"status": "idle", "ip": self.ip})
+        self.value = [dbus.Byte(x) for x in msg.encode('utf-8')]
+        self.last_activity = time.time()
+        GLib.timeout_add_seconds(60, self.idle_timeout_check)
+
+    def get_local_ip(self):
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            return s.getsockname()[0]
+        except Exception:
+            return "0.0.0.0"
+        finally:
+            s.close()
 
     def ReadValue(self, options):
+        self.last_activity = time.time()
+        wifi_list = self.wifi_manager.scan_wifi_networks()
+        return array.array('B', '\n'.join(wifi_list).encode('utf-8'))
+
+    def WriteValue(self, value, options):
+        self.last_activity = time.time()
         try:
-            logger.info('Reading current WLAN settings')
-            self.wpa.read()
-            ssid = self.wpa.params['ssid'] if self.wpa.params['ssid'] != '' else "Empty"
-            logger.info(f"ssid: {ssid}")
-            return bytearray(ssid,"utf-8")
-        except Exception as e:
-            logger.exception(f"Error in ReadValue: {e}")
-            raise
-    
-    def WriteValue(self,value, options):
-        try:
-            logger.info('Writing new WLAN configuration')
-            self.wpa.read()
-            data = json.loads(bytearray(value).decode('utf-8'))
-            logger.info(data)
-            logger.info(f"params ssid: {self.wpa.params['ssid']}")
-            for key, value in data:
-                if key in self.wpa.params:
-                    self.wpa.params[key] = data[key] 
-            self.wpa.write()
-            self.wpa.restart_wlan_interface()
+            config = json.loads(bytearray(value).decode('utf-8'))
+            self.wifi_manager.set_credentials(config['ssid'], config['psk'])
+            result = self.wifi_manager.connect()
+            self.ip = self.get_local_ip()
+            status = "connected" if result["success"] else "failed"
+
+            self.value = [dbus.Byte(x) for x in json.dumps({
+                "status": status,
+                "reason": result["message"],
+                "ip": self.ip
+            }).encode('utf-8')]
+
             if self.notifying:
-                msg = json.dumps({"status":"success"})
-                self.PropertiesChanged(
-                    GATT_CHRC_IFACE,
-                    {"Value": dbus.ByteArray(msg.encode("utf-8"))},
-                    [],
-                )
+                self.PropertiesChanged(GATT_CHARACTERISTIC_IFACE, {'Value': dbus.Array(self.value, signature='y')}, [])
+
+            if result["success"]:
+                GLib.timeout_add_seconds(10, self.disconnect_client)
+            else:
+                GLib.timeout_add_seconds(10, self.service.application.restart_advertising)
+
         except Exception as e:
-            logger.error(f"EXCEPTION: {e}")
-            if self.notifying:
-                msg = json.dumps({"status":f"error: {e}"})
-                self.PropertiesChanged(
-                    GATT_CHRC_IFACE,
-                    {"Value":dbus.ByteArray(msg.encode("utf-8"))},
-                    [],
-                )
-            raise
-    
+            logger.error(f"Error in WriteValue: {e}")
+
     def StartNotify(self):
-        if self.notifying:
-            return
-        logger.info("Notifications started")
         self.notifying = True
-    
+        self.notify()
+
     def StopNotify(self):
-        if not self.notifying:
-            return
-        logger.info("Notifications Stopped")
         self.notifying = False
 
+    def notify(self):
+        if self.notifying:
+            self.PropertiesChanged(GATT_CHARACTERISTIC_IFACE, {'Value': dbus.Array(self.value, signature='y')}, [])
+            GLib.timeout_add_seconds(2, self.notify)
 
-class WlanSetupAdvertisement(Advertisement):
-    IFACE_BT_NAME = "Arbi"
+    def idle_timeout_check(self):
+        if time.time() - self.last_activity > 300:
+            logger.info("Idle timeout reached. Disconnecting BLE client.")
+            return self.disconnect_client()
+        return True
+
+    def disconnect_client(self):
+        try:
+            adapter = dbus.Interface(self.bus.get_object("org.bluez", "/org/bluez/hci0"), "org.bluez.Adapter1")
+            for device_path in self.get_connected_devices():
+                adapter.RemoveDevice(device_path)
+                logger.info(f"Disconnected BLE client: {device_path}")
+        except Exception as e:
+            logger.error(f"Failed to disconnect client: {e}")
+        return False
+
+    def get_connected_devices(self):
+        obj_manager = dbus.Interface(self.bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+        managed = obj_manager.GetManagedObjects()
+        return [path for path, interfaces in managed.items() if 'org.bluez.Device1' in interfaces and interfaces['org.bluez.Device1'].get('Connected')]
+
+
+class WPAService(Service):
+    WPA_SERVICE_UUID = '00001801-0000-1000-9000-00805f9b34fb'
     def __init__(self, bus, index):
-        super().__init__(bus, index, "peripheral")
-        self.add_local_name(self.IFACE_BT_NAME)
-        self.include_local_name = True
+        super().__init__(bus, index, self.WPA_SERVICE_UUID, True)
+        self.wpa_characteristic = WPACharacteristic(bus, 1, self)
+        self.add_characteristic(self.wpa_characteristic)
+
+
+class WPAAdvertisement(Advertisement):
+    def __init__(self, bus, index, mainloop):
+        super().__init__(bus, index, 'peripheral', mainloop)
+        self.add_service_uuid(WPAService.WPA_SERVICE_UUID)
+        self.add_local_name(socket.gethostname())
         self.include_tx_power = True
-        self.add_service_uuid(WPAManageService.WLANMANAGE_SVC_UUID)
-        #self.add_manufacturer_data(0xFFFF, [0x70, 0x74],)
+        self.set_adapter_property('Discoverable', dbus.Boolean(1))
+        self.set_adapter_property('DiscoverableTimeout', dbus.UInt32(0))
+        self.set_adapter_property('Pairable', dbus.Boolean(1))
+        self.set_adapter_property('PairableTimeout', dbus.UInt32(0))
 
-def power_up_ble_interface(adapter_props):
-        # powered property on the controller to off
-        adapter_props.Set(ADAPTER_IFACE, "Powered", dbus.Boolean(1))
-        adapter_props.Set(ADAPTER_IFACE, "Discoverable", dbus.Boolean(1))
-        adapter_props.Set(ADAPTER_IFACE, "Alias", "Arbi")
-        adapter_props.Set(ADAPTER_IFACE, "Pairable", dbus.Boolean(0))
-
-def power_down_ble_interface():
-        # powered property on the controller to on
-        os.system("bluetoothctl power on")
 
 def main():
-
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
-
     bus = dbus.SystemBus()
+    agent = Agent(bus)
+    agent.set_exit_on_release(False)
+    agent_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez"), "org.bluez.AgentManager1")
+    agent_manager.RegisterAgent(AGENT_PATH, "KeyboardDisplay")
+    agent_manager.RequestDefaultAgent(AGENT_PATH)
+    logger.info("Agent registered for secure pairing")
 
-    adapter = find_adapter(bus)
-    if not adapter:
-        logger.critical("GattManager1 interface not found")
-        return
+    advertisement = WPAAdvertisement(bus, 0, mainloop)
+    application = Application(bus, mainloop)
+    wpa_service = WPAService(bus, 0)
+    wpa_service.wpa_characteristic.service = wpa_service  # Inject for callbacks
+    wpa_service.application = application                 # For restart access
+    application.add_service(wpa_service)
 
-    adapter_obj = bus.get_object(BLUEZ_SERVICE_NAME, adapter)
-
-    adapter_props = dbus.Interface(adapter_obj, DBUS_PROP_IFACE)
-
-    power_up_ble_interface(adapter_props)
-    
-    # Get manager objs
-    service_manager = dbus.Interface(adapter_obj, GATT_MANAGER_IFACE)
-    ad_manager = dbus.Interface(adapter_obj, LE_ADVERTISING_MANAGER_IFACE)
-
-    advertisement = WlanSetupAdvertisement(bus, 0)
-    bluez_obj = bus.get_object(BLUEZ_SERVICE_NAME, "/org/bluez")
-
-    #agent = Agent(bus, AGENT_PATH)
-
-    app = Application(bus)
-    app.add_service(WPAManageService(bus, 2))
-
-    #agent_manager = dbus.Interface(bluez_obj, "org.bluez.AgentManager1")
-    #agent_manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
-
-    ad_manager.RegisterAdvertisement(
-        advertisement.get_path(),
-        {},
-        reply_handler=register_ad_cb,
-        error_handler=register_ad_error_cb,
-    )
-
-    logger.info("Registering GATT application")
-
-    service_manager.RegisterApplication(
-        app.get_path(),
-        {},
-        reply_handler=register_app_cb,
-        error_handler=register_app_error_cb,
-    )
-
-    #agent_manager.RequestDefaultAgent(AGENT_PATH)
+    application.register_application()
+    advertisement.start_advertisement()
 
     mainloop.run()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     try:
         main()
     except KeyboardInterrupt:
-        power_down_ble_interface()
-        logging.info("BLE proxy is closed...")
+        logger.info("Exiting application")
+        mainloop.quit()

@@ -1,521 +1,912 @@
+import array
+import json
+import subprocess
 import dbus
-import dbus.exceptions
 import dbus.mainloop.glib
 import dbus.service
-import logging 
+import dbus.exceptions
+import logging  
+import os
+import sys
+import time
+from gi.repository import GLib
+from gi.repository import GObject  
 
-import array
-from gi.repository import GObject, GLib
-#import sys
-#from random import randint
 
-
-mainloop = None
 
 
 logger = logging.getLogger(__name__)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
-logHandler = logging.StreamHandler()
-filelogHandler = logging.FileHandler("ble.log")
-
-logHandler.setFormatter(formatter)
-filelogHandler.setFormatter(formatter)
-
-logger.addHandler(logHandler)
-logger.addHandler(filelogHandler)
-
 logger.setLevel(logging.INFO)
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 
+loghandler = logging.StreamHandler()
+loghandler.setFormatter(formatter)
+
+loghandlerfile = logging.FileHandler('gatt_module.log')
+loghandlerfile.setFormatter(formatter)
+
+logger.addHandler(loghandler)
+logger.addHandler(loghandlerfile)
+
+
+mainloop = None
 bus = None
-device_obj = None
-dev_path = None
-
-AGENT_PATH = "/org/bluez/ble/agent"
 
 
+# Interface UUIDs
 BLUEZ_SERVICE_NAME = 'org.bluez'
+BLUEZ_SERVICE_PATH = '/org/bluez'
 
-AGENT_IFACE = 'org.bluez.Agent1'
-
-DEVICE_IFACE = 'org.bluez.Device1'
-ADAPTER_IFACE = "org.bluez.Adapter1"
-
-DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
-DBUS_PROP_IFACE = 'org.freedesktop.DBus.Properties'
-
-
-GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
 GATT_SERVICE_IFACE = 'org.bluez.GattService1'
-GATT_CHRC_IFACE =    'org.bluez.GattCharacteristic1'
-GATT_DESC_IFACE =    'org.bluez.GattDescriptor1'
+GATT_CHARACTERISTIC_IFACE = 'org.bluez.GattCharacteristic1'
+GATT_DESCRIPTOR_IFACE = 'org.bluez.GattDescriptor1'
+GATT_MANAGER_IFACE = 'org.bluez.GattManager1'
 
-LE_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
-LE_ADVERTISING_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
+GATT_ADAPTER_IFACE = 'org.bluez.Adapter1'
+GATT_DEVICE_IFACE = 'org.bluez.Device1'
+
+GATT_AGENT_IFACE = 'org.bluez.Agent1'
+AGENT_PATH = '/org/bluez/ble/agent'
+
+DBUS_PROPERTIES_IFACE = 'org.freedesktop.DBus.Properties'
+DBUS_OM_IFACE = 'org.freedesktop.DBus.ObjectManager'
+
+GATT_LE_ADVERTISING_MANAGER_IFACE = 'org.bluez.LEAdvertisingManager1'
+GATT_ADVERTISEMENT_IFACE = 'org.bluez.LEAdvertisement1'
 
 
 
 class InvalidArgsException(dbus.exceptions.DBusException):
+    """
+    Exception raised for invalid arguments.
+    """
     _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidArgs'
 
 class NotSupportedException(dbus.exceptions.DBusException):
+    """
+    Exception raised for not supported operations.
+    """
     _dbus_error_name = 'org.freedesktop.DBus.Error.NotSupported'
 
 class NotPermittedException(dbus.exceptions.DBusException):
+    """
+    Exception raised for not permitted operations.
+    """
     _dbus_error_name = 'org.freedesktop.DBus.Error.NotPermitted'
 
-class InvalidValueLengthException(dbus.exceptions.DBusException):
-    _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidValueLength'
+class NotAuthorizedException(dbus.exceptions.DBusException):
+    """
+    Exception raised for not authorized operations.
+    """
+    _dbus_error_name = 'org.freedesktop.DBus.Error.NotAuthorized'
 
 class FailedException(dbus.exceptions.DBusException):
+    """
+    Exception raised for failed operations.
+    """
     _dbus_error_name = 'org.freedesktop.DBus.Error.Failed'
 
-class Rejected(dbus.DBusException):
-    _dbus_error_name = "org.bluez.Error.Rejected"
-
-
-class Application(dbus.service.Object):
+class NotFoundException(dbus.exceptions.DBusException):
     """
-    GattApplication1 interface implementation
+    Exception raised for not found operations.
     """
+    _dbus_error_name = 'org.freedesktop.DBus.Error.NotFound'
 
-    def __init__(self, bus):
-        self.path = "/"
+class RejectedException(dbus.exceptions.DBusException):
+    """
+    Exception raised for rejected operations.
+    """
+    _dbus_error_name = 'org.freedesktop.DBus.Error.Rejected'
+
+class InvalidValueLengthException(dbus.exceptions.DBusException):
+    """
+    Exception raised for invalid value length.
+    """
+    _dbus_error_name = 'org.freedesktop.DBus.Error.InvalidValueLength'
+
+
+
+class Application (dbus.service.Object):
+    """
+    GATT Application class that manages GATT services and characteristics.
+    """
+    def __init__(self, bus, mainloop):
+        self.path ="/"
+        self.mainloop = mainloop
         self.services = []
+        self.bus = bus
+        self.adapter = self.find_adapter()
+        self.adapter_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, self.adapter)
         dbus.service.Object.__init__(self, bus, self.path)
 
+    def find_adapter(self):
+        """
+        Find the adapter for the application.
+        """
+        remote_om = dbus.Interface(self.bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+        objects = remote_om.GetManagedObjects()
+        adapter = None
+        for path, ifaces in objects.items():
+            if GATT_ADAPTER_IFACE in ifaces:
+                adapter = path
+                break
+        return adapter
 
     def get_path(self):
+        """
+        Get the path of the application.
+        """
         return dbus.ObjectPath(self.path)
     
+
     def add_service(self, service):
+        """
+        Add a GATT service to the application.
+        """
         self.services.append(service)
 
 
     @dbus.service.method(DBUS_OM_IFACE, out_signature = 'a{oa{sa{sv}}}')
     def GetManagedObjects(self):
-        response={}
-        logger.info('GetManagerObjects')
-
+        """
+        Get all managed objects.
+        """
+        objects = {}
         for service in self.services:
-            response[service.get_path()] = service.get_properties()
-            chrcs = service.get_characteristics()
-            for chrc in chrcs:
-                response[chrc.get_path()] = chrc.get_properties()
-                descs = chrc.get_descriptors()
-                for desc in descs:
-                    response[desc.get_path()] = desc.get_properties()
+            objects[service.get_path()] = service.get_properties()
+            for characteristic in service.characteristics:
+                objects[characteristic.get_path()] = characteristic.get_properties()
+                for descriptor in characteristic.descriptors:
+                    objects[descriptor.get_path()] = descriptor.get_properties()
+        logger.debug(f"Managed objects tree: {json.dumps(str(objects), indent=2)}")
+        return objects
+    
+    def register_application(self):
+        """
+        Register the application with the GATT manager.
+        """
+        logger.info("Registering application")
+        gatt_manager = dbus.Interface(self.adapter_obj, GATT_MANAGER_IFACE)
+        gatt_manager.RegisterApplication(self.path, {}, reply_handler=self.register_success, error_handler=self.register_error)
+        logger.info("Application registered")
 
-        return response
+    def unregister_application(self):
+        """
+        Unregister the application from the GATT manager.
+        """
+        logger.info("Unregistering application")
+        gatt_manager = dbus.Interface(self.adapter_obj, GATT_MANAGER_IFACE)
+        gatt_manager.UnregisterApplication(self.path, reply_handler=self.unregister_success, error_handler=self.unregister_error)
+        logger.info("Application unregistered")
+
+    def unregister_error(self, error):
+        """
+        Unregister an error callback.
+        """
+        logger.error(f"Application unregistration error: {error}")
+        self.mainloop.quit() 
+
+    def unregister_success(self):
+        """
+        Unregister a success callback.
+        """
+        logger.info("Application unregistration successful")
+        self.mainloop.quit()
+    
+    def register_error(self, error):
+        """
+        Register an error callback.
+        """
+        logger.error(f"Application registration error: {error}")
+        self.mainloop.quit()
+    
+    def register_success(self):
+        """
+        Register a success callback.
+        """
+        logger.info("Application registration successful")
+        pass
     
 
-class Service(dbus.service.Object):
+class Service (dbus.service.Object):
     """
-        GattService1 interface implementation
+    GATT Service class that represents a GATT service.
     """
-    PATHBASE = '/org/bluez/ble/service'
 
-    def __init__(self, bus, index, uuid, primary):
-        self.path = self.PATHBASE + str(index)
+    PATH_BASE = '/org/bluez/ble/service/'
+
+    def __init__(self, bus, index, uuid, primary=True):
+        self.path = self.PATH_BASE + str(index)
         self.bus = bus
         self.uuid = uuid
         self.primary = primary
         self.characteristics = []
         dbus.service.Object.__init__(self, bus, self.path)
 
-    def get_properties(self):
-        return {
-            GATT_SERVICE_IFACE:{
-                'UUID': self.uuid,
-                'Primary': self.primary,
-                'Characteristics': dbus.Array(
-                    self.get_characteristics_paths(),
-                    signature= 'o')
-            }
-        }
-    
+
     def get_path(self):
+        """
+        Get the path of the service.
+        """
         return dbus.ObjectPath(self.path)
     
     def add_characteristic(self, characteristic):
+        """
+        Add a GATT characteristic to the service.
+        """
         self.characteristics.append(characteristic)
 
-    def get_characteristics_paths(self):
+    def get_characteristics(self):
+        """
+        Get all characteristics of the service.
+        """
+        return self.characteristics
+
+    def get_characteristic(self, uuid):
+        """
+        Get a GATT characteristic by UUID.
+        """
+        for characteristic in self.characteristics:
+            if characteristic.uuid == uuid:
+                return characteristic
+        raise NotFoundException("Characteristic not found")
+
+    def get_characteristics_path(self):
+        """
+        Get the paths of all characteristics.
+        """
         result = []
-        for chrc in self.characteristics:
-            result.append(chrc.get_path())
+        if not self.characteristics:
+            raise NotFoundException("No characteristics found")
+        for characteristic in self.characteristics:
+            result.append(characteristic.get_path())
         return result
     
-    def get_characteristics(self):
-        return self.characteristics
+    def get_properties(self):
+        """
+        Get the properties of the service.
+        """
+        return {
+            GATT_SERVICE_IFACE: {
+                'UUID': self.uuid,
+                'Primary': self.primary,
+                'Characteristics': dbus.Array(self.get_characteristics_path(), signature='o')
+            }
+        }
     
-    @dbus.service.method(DBUS_PROP_IFACE, in_signature='s', out_signature = 'a{sv}')
-    def GetAll(self, interface):
+    @dbus.service.method(DBUS_PROPERTIES_IFACE, in_signature='s',out_signature='a{sv}')
+    def GEtAll(self,interface):
+        """
+        Get all properties of the service.
+        """
         if interface != GATT_SERVICE_IFACE:
-            raise InvalidArgsException()
+            raise InvalidArgsException("Invalid interface")
         return self.get_properties()[GATT_SERVICE_IFACE]
     
 
-class Characteristic(dbus.service.Object):
+class Characteristic (dbus.service.Object):
     """
-    GattCharacteristic1 interface implementation
+    GATT Characteristic class that represents a GATT characteristic.
     """
-
     def __init__(self, bus, index, uuid, flags, service):
-        self.path = service.path +'/char'+ str(index)
-        self.service = service
+        self.path = service.path +"/char" +str(index)
         self.bus = bus
         self.uuid = uuid
         self.flags = flags
+        self.service = service
         self.descriptors = []
         dbus.service.Object.__init__(self, bus, self.path)
 
+    def get_path(self):
+        """
+        Get the path of the characteristic.
+        """
+        return dbus.ObjectPath(self.path)
+    
+    def add_descriptor(self,descriptor):
 
+        """
+        Add a GATT descriptor to the characteristic.
+        """
+        self.descriptors.append(descriptor)
+
+    def get_descriptor(self,uuid):
+        """
+        Get a GATT descriptor by UUID.
+        """
+        for descriptor in self.descriptors:
+            if descriptor.uuid == uuid:
+                return descriptor
+        raise NotFoundException("Descriptor not found")
+
+    def get_descriptors(self):
+        """
+        Get all descriptors of the characteristic.
+        """
+        return self.descriptors
+    
+    def get_descriptors_path(self):
+        """
+        Get the paths of all descriptors.
+        """
+        result = []
+        if not self.descriptors:
+            raise NotFoundException("No descriptors found")
+        for descriptor in self.descriptors:
+            result.append(descriptor.get_path())
+        return result
+    
     def get_properties(self):
+        """
+        Get the properties of the characteristic.
+        """
         return {
-            GATT_CHRC_IFACE: {
-                'Service': self.service,
+            GATT_CHARACTERISTIC_IFACE: {
                 'UUID': self.uuid,
-                'Flags': self.flags,
-                'Descriptors': dbus.Array(
-                    self.get_descriptors_paths(),
-                    signature='o'
-                )
+                'Service': self.service.get_path(),
+                'Flags': dbus.Array(self.flags, signature='s'),
+                'Descriptors': dbus.Array(self.get_descriptors_path(), signature='o')
             }
         }
     
-    def get_path(self):
-        return dbus.ObjectPath(self.path)
+    @dbus.service.method(DBUS_PROPERTIES_IFACE, in_signature='s',out_signature='a{sv}')
+    def GEtAll(self,interface):
+        """
+        Get all properties of the characteristic.
+        """
+        if interface != GATT_CHARACTERISTIC_IFACE:
+            raise InvalidArgsException("Invalid interface")
+        return self.get_properties()[GATT_CHARACTERISTIC_IFACE]
     
-    def get_descriptors_paths(self):
-        results = []
-        for desc in self.descriptors:
-            results.append(desc.get_path())
-        return results
-    
-    def add_descriptor(self, descriptor):
-        self.descriptors.append(descriptor)
 
-    def get_descriptors(self):
-        return self.descriptors
-    
-    @dbus.service.method(DBUS_PROP_IFACE, in_signature= 's', out_signature = 'a{sv}')
-    def GetAll(self, interface):
-        if interface != GATT_CHRC_IFACE:
-            raise InvalidArgsException()
-        return self.get_properties()[GATT_CHRC_IFACE]
-    
-    @dbus.service.method(GATT_CHRC_IFACE, in_signature='a{sv}', out_signature='ay')
+    @dbus.service.method(GATT_CHARACTERISTIC_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
-        logger.info('Default ReadValue called, returning error')
-        raise NotSupportedException()
+        """
+        Read the value of the characteristic.
+        """
+        logger.info("Default ReadValue called")
+        raise NotSupportedException("Read not supported")
     
-    @dbus.service.method(GATT_CHRC_IFACE, in_signature='aya{sv}')
+    @dbus.service.method(GATT_CHARACTERISTIC_IFACE, in_signature='aya{sv}', out_signature='')
     def WriteValue(self, value, options):
-        logger.info('Default WriteValue called, returning error')
-        raise NotSupportedException()
+        """
+        Write a value to the characteristic.
+        """
+        logger.info("Default WriteValue called")
+        raise NotSupportedException("Write not supported")
     
-    @dbus.service.method(GATT_CHRC_IFACE)
+    @dbus.service.method(GATT_CHARACTERISTIC_IFACE)
     def StartNotify(self):
-        logger.info('Default StartNotify called, returning error')
-        raise NotSupportedException()
+        """
+        Start notifications for the characteristic.
+        """
+        logger.info("Default StartNotify called")
+        raise NotSupportedException("Notifications not supported")
     
-    @dbus.service.method(GATT_CHRC_IFACE)
+    @dbus.service.method(GATT_CHARACTERISTIC_IFACE)
     def StopNotify(self):
-        logger.info('Default StopNotify called, returning error')
-        raise NotSupportedException()
+        """
+        Stop notifications for the characteristic.
+        """
+        logger.info("Default StopNotify called")
+        raise NotSupportedException("Notifications not supported")
     
-    @dbus.service.signal(DBUS_PROP_IFACE, signature = 'sa{sv}as')
+    @dbus.service.signal(DBUS_PROPERTIES_IFACE, signature='sa{sv}as')
     def PropertiesChanged(self, interface, changed, invalidated):
+        """
+        Signal that properties have changed.
+        """
+        logger.info("PropertiesChanged signal emitted")
         pass
 
+    def get_value(self):
+        """
+        Get the value of the characteristic.
+        """
+        return self.value
+    
+    def set_value(self, value):
+        """
+        Set the value of the characteristic.
+        """
+        self.value = value
+        self.PropertiesChanged(GATT_CHARACTERISTIC_IFACE, {'Value': dbus.Array(value, signature='y')}, [])
 
-class Descriptor(dbus.service.Object):
+    
+class Descriptor (dbus.service.Object):
     """
-    GattDescriptor1 interface implementation
+    GATT Descriptor class that represents a GATT descriptor.
     """
-
     def __init__(self, bus, index, uuid, flags, characteristic):
-        self.path = characteristic.path + '/desc' + str(index)
+        self.path = characteristic.path + "/descriptor" +str(index)
         self.bus = bus
         self.uuid = uuid
         self.flags = flags
-        self.chrc = characteristic
+        self.characteristic = characteristic
         dbus.service.Object.__init__(self, bus, self.path)
 
+    def get_path(self):
+        """
+        Get the path of the descriptor.
+        """
+        return dbus.ObjectPath(self.path)
+    
     def get_properties(self):
+        """
+        Get the properties of the descriptor.
+        """
         return {
-            GATT_DESC_IFACE:{
-                'Characteristic': self.chrc.get_path(),
+            GATT_DESCRIPTOR_IFACE: {
                 'UUID': self.uuid,
-                'Flags': self.flags
+                'Characteristic': self.characteristic.get_path(),
+                'Flags': dbus.Array(self.flags, signature='s')
             }
         }
     
-    def get_path(self):
-        return dbus.ObjectPath(self.path)
-
-    @dbus.service.method(DBUS_PROP_IFACE, in_signature = 's', out_signature ='a{sv}')
-    def GetAll(self, interface):
-        if interface != GATT_DESC_IFACE:
-            raise InvalidArgsException()
-        
-        return self.get_properties()[GATT_DESC_IFACE]
+    @dbus.service.method(DBUS_PROPERTIES_IFACE, in_signature='s',out_signature='a{sv}')
+    def GEtAll(self,interface):
+        """
+        Get all properties of the descriptor.
+        """
+        if interface != GATT_DESCRIPTOR_IFACE:
+            raise InvalidArgsException("Invalid interface")
+        return self.get_properties()[GATT_DESCRIPTOR_IFACE]
     
-    @dbus.service.method(GATT_DESC_IFACE, in_signature = 'a{sv}', out_signature = 'ay')
+    @dbus.service.method(GATT_DESCRIPTOR_IFACE, in_signature='a{sv}', out_signature='ay')
     def ReadValue(self, options):
-        logger.info('Default ReadValue called, returning error')
-        raise NotSupportedException()
+        """
+        Read the value of the descriptor.
+        """
+        logger.info("Default ReadValue called")
+        raise NotSupportedException("Read not supported")
     
-    @dbus.service.method(GATT_DESC_IFACE, in_signature='aya{sv}')
+    @dbus.service.method(GATT_DESCRIPTOR_IFACE, in_signature='aya{sv}', out_signature='')
     def WriteValue(self, value, options):
-        logger.info('Default WriteValue called, returning error')
-        raise NotSupportedException()
+        """
+        Write a value to the descriptor.
+        """
+        logger.info("Default WriteValue called")
+        raise NotSupportedException("Write not supported")
     
+    @dbus.service.signal(DBUS_PROPERTIES_IFACE, signature='sa{sv}as')
+    def PropertiesChanged(self, interface, changed, invalidated):
+        """
+        Signal that properties have changed.
+        """
+        logger.info("PropertiesChanged signal emitted")
+        pass
 
-class Advertisement(dbus.service.Object):
-    """
-    GattAdvertisement1 interface implementation
-    """
-    PATH_BASE = '/org/bluez/ble/advertisement'
-
-    def __init__(self, bus, index, advertising_type):
-        self.path = self.PATH_BASE + str(index)
-        self.bus = bus
-        self.ad_type = advertising_type
-        self.service_uuids = None
-        self.manufacturer_data = None
-        self.solicit_uuids = None
-        self.service_data = None
-        self.local_name = None 
-        self.include_tx_power = False
-        self.data = None
-        dbus.service.Object.__init__(self, bus, self.path)
-
-
-    def get_properties(self):
-        properties = dict()
-        properties['Type']= self.ad_type
-        if self.service_uuids is not None:
-            properties['ServiceUUIDs'] = dbus.Array(self.service_uuids, signature = 's')
-
-        if self.solicit_uuids is not None:
-            properties['SolicitUUIDs'] = dbus.Array(self.solicit_uuids, signature = 's')
-
-        if self.manufacturer_data is not None:
-            properties['ManufacturerData'] = dbus.Dictionary(self.manufacturer_data, signature = 'qv')
-        if self.service_data is not None:
-            properties['ServiceData'] = dbus.Dictionary(self.service_data, signature = 'sv')
-
-        if self.local_name is not None:
-            properties['LocalName'] = dbus.String(self.local_name)
-
-        if self.include_tx_power:
-            properties['Includes'] = dbus.Array(["tx-power"], signature='s')
-
-        if self.data is not None:
-            properties['Data'] = dbus.Dictionary(self.data, signature='yv')
-        logger.info(f"properties: {properties}")
-        return {
-            LE_ADVERTISEMENT_IFACE: properties
-        }
+    def get_value(self):
+        """
+        Get the value of the descriptor.
+        """
+        return self.value
     
-    def get_path(self):
-        return dbus.ObjectPath(self.path)
-    
-
-    def add_service_uuid(self, uuid):
-        if not self.service_uuids:
-            self.service_uuids = []
-        self.service_uuids.append(uuid)
-
-    def add_solicit_uuid(self, uuid):
-        if not self.solicit_uuids:
-            self.solicit_uuids = []
-        self.solicit_uuids.append(uuid)
-
-    def add_manufacturer_data(self, manuf_code, data):
-        if not self.manufacturer_data:
-            self.manufacturer_data = dbus.Dictionary({}, signature='qv')
-        self.manufacturer_data[manuf_code] = dbus.Array(data, signature='y')
-
-    def add_service_data(self, uuid, data):
-        if not self.service_data:
-            self.service_data = dbus.Dictionary({}, signature='sv')
-        self.service_data[uuid] = dbus.Array(data, signature='y')
-
-    def add_local_name(self, name):
-        if not self.local_name:
-            self.local_name = ""
-        self.local_name = dbus.String(name)
-
-    def add_data(self, ad_type, data):
-        if not self.data:
-            self.data = dbus.Dictionary({}, signature='yv')
-        self.data[ad_type] = dbus.Array(data, signature='y')
-
-    @dbus.service.method(DBUS_PROP_IFACE,
-                         in_signature='s',
-                         out_signature='a{sv}')
-    def GetAll(self, interface):
-        logger.info('GetAll')
-        if interface != LE_ADVERTISEMENT_IFACE:
-            raise InvalidArgsException()
-        logger.info('returning props')
-        return self.get_properties()[LE_ADVERTISEMENT_IFACE]
-    
-    @dbus.service.method(LE_ADVERTISEMENT_IFACE,
-                         in_signature='',
-                         out_signature='')
-    def Release(self):
-        logger.info('%s: Released!' % self.path)
-
-
-
-
-def question(prompt):
-    return input(prompt)
-
-def set_trusted(path):
-    props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, path),DBUS_PROP_IFACE) 
-    props.Set(DEVICE_IFACE, 'Trusted', True)
-
-def dev_connect(path):
-    dev = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, path), DEVICE_IFACE)
-    dev.Connect()
-
-def pair_reply():
-    logger.info("Device paired")
-    set_trusted(dev_path)
-    dev_connect(dev_path)
-    mainloop.quit()
-
-def pair_error(error):
-    err_name = error.get_dbus_name()
-    if err_name == "org.freedesktop.DBus.Error.NoReply" and device_obj:
-        logger.info("Timed out. Cancelling pairing")
-        device_obj.CancelPairing()
-    else:
-        logger.info("Creating device failed: %s" % (error))
-    mainloop.quit()
-
-def find_adapter(bus):
-    remote_om = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, '/'),
-                               DBUS_OM_IFACE)
-    objects = remote_om.GetManagedObjects()
-
-    for o, props in objects.items():
-        if GATT_MANAGER_IFACE in props.keys():
-            return o
-    return None
-
-def register_app_cb():
-    logger.info('GATT application registered')
-
-
-def register_app_error_cb(error):
-    logger.critical('Failed to register application: ' + str(error))
-    mainloop.quit()
-
-
-def register_ad_cb():
-    logger.info('Advertisement registered')
-
-
-def register_ad_error_cb(error):
-    logger.critical('Failed to register advertisement: ' + str(error))
-    mainloop.quit()
-
+    def set_value(self, value): 
+        """
+        Set the value of the descriptor.
+        """
+        self.value = value
+        self.PropertiesChanged(GATT_DESCRIPTOR_IFACE, {'Value': dbus.Array(value, signature='y')}, [])
 
 
 class Agent(dbus.service.Object):
     """
-    Agent1 interface manipulation
+    GATT Agent class that handles agent operations.
     """
-
+    def __init__(self, bus):
+        self.bus = bus
+        dbus.service.Object.__init__(self, bus, AGENT_PATH)
     exit_on_release = True
-
     def set_exit_on_release(self, exit_on_release):
+        """
+        Set whether to exit on release.
+        """
         self.exit_on_release = exit_on_release
+    
+    def set_trusted(self,path):
+        """
+        Set the trusted path.
+        """
+        props = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, path), GATT_DEVICE_IFACE)
+        props.set(GATT_DEVICE_IFACE, 'Trusted', dbus.Boolean(1))
+        logger.info(f"Device {path} set as trusted")
+    
+    def question(self, prompt):
+        return input(prompt)
 
-    @dbus.service.method(AGENT_IFACE, in_signature = '',out_signature = '')
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='', out_signature='')
     def Release(self):
-        logger.info("Release")
+        """
+        Release the agent.
+        """
+        logger.info("Agent released")
         if self.exit_on_release:
+            logger.info("Exiting application")
             mainloop.quit()
+        else:
+            logger.info("Continuing application")
 
-    @dbus.service.method(AGENT_IFACE, in_signature = 'os', out_signature = '')
-    def AuthorizeService(self, device, uuid):
-        logger.info( "AuthorizeService (%s,%s)" % (device, uuid))
-        authorize = question("Authorize connection (yes/no): ")
-        if authorize == "yes":
-            return
-        raise Rejected("Connection rejected by user")
-    
-    @dbus.service.method(AGENT_IFACE,in_signature="o", out_signature="s")
-    def RequestPinCode(self, device):
-        logger.info(f"RequestPinCode ({device})")
-        set_trusted(device)
-        return question('Enter PIN code: ' )
-    
-    @dbus.service.method(AGENT_IFACE,in_signature="o", out_signature="u")
-    def RequestPasskey(self, device):
-        logger.info("RequestPasskey (%s)" % (device))
-        set_trusted(device)
-        passkey = question("Enter passkey: ")
-        return dbus.UInt32(passkey)
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='o', out_signature='s')
+    def RequestPinCode(self,device):
+        """
+        Request a PIN code from the agent.
+        """
+        logger.info(f"RequestPinCode called for device {device}")
+        self.set_trusted(device)
+        pincode = self.question("Enter PIN code: ")
+        logger.info(f"PIN code entered: {pincode}")
+        if not pincode:
+            raise InvalidArgsException("Invalid PIN code")
+        if len(pincode) < 4 or len(pincode) > 16:
+            raise InvalidValueLengthException("PIN code length must be between 4 and 16 characters")
+        if not pincode.isdigit():
+            raise InvalidArgsException("PIN code must be numeric")
+        if not pincode.isascii():
+            raise InvalidArgsException("PIN code must be ASCII")
+        if not pincode.isalnum():
+            raise InvalidArgsException("PIN code must be alphanumeric")
+        if not pincode.isprintable():
+            raise InvalidArgsException("PIN code must be printable")
+        return pincode.encode('utf-8')
 
-    @dbus.service.method(AGENT_IFACE, in_signature="ouq", out_signature="")
-    def DisplayPasskey(self, device, passkey, entered):
-        logger.info(f"DisplayPasskey ({device}, {passkey} entered {entered})")
-
-    @dbus.service.method(AGENT_IFACE, in_signature="os", out_signature="")
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='os', out_signature='')
     def DisplayPinCode(self, device, pincode):
-        logger.info("DisplayPinCode (%s, %s)" % (device, pincode))
+        """
+        Display the PIN code on the agent.
+        """
+        logger.info(f"DisplayPinCode called for device {device}, PIN code: {pincode}")
 
-    @dbus.service.method(AGENT_IFACE, in_signature="ou", out_signature="")
-    def RequestConfirmation(self, device, passkey):
-        logger.info("RequestConfirmation (%s, %06d)" % (device, passkey))
-        confirm = question("Confirm passkey (yes/no): ")
-        if (confirm == "yes"):
-            set_trusted(device)
-            return
-        raise Rejected("Passkey doesn't match")
-
-    @dbus.service.method(AGENT_IFACE, in_signature="o", out_signature="")
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='o', out_signature='')
     def RequestAuthorization(self, device):
-        logger.info("RequestAuthorization (%s)" % (device))
-        auth = question("Authorize? (yes/no): ")
-        if (auth == "yes"):
+        """
+        Request authorization from the agent.
+        """
+        logger.info(f"RequestAuthorization called for device {device}")
+        authenticated = self.question("Authorize connection (y/n): ")
+        if authenticated.lower() == 'y':
+            logger.info("Device authorized")
             return
-        raise Rejected("Pairing rejected")
+        elif authenticated.lower() == 'n':
+            logger.info("Device not authorized")
+            raise NotPermittedException("Device not permitted")
+        elif authenticated.lower() == 'q':
+            logger.info("Device not authorized")
+            raise NotPermittedException("Device not permitted")
+        raise RejectedException("Device rejected")
+    
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='os', out_signature='')
+    def AuthorizeService(self, device, uuid):
+        """
+        Authorize a service from the agent.
+        """
+        logger.info(f"AuthorizeService called for device {device}, UUID: {uuid}")
+        authenticated = self.question("Authorize service (y/n): ")
+        if authenticated.lower() == 'y':
+            logger.info("Service authorized")
+            return
+        elif authenticated.lower() == 'n':
+            logger.info("Service not authorized")
+            raise NotPermittedException("Service not permitted")
+        elif authenticated.lower() == 'q':
+            logger.info("Service not authorized")
+            raise NotPermittedException("Service not permitted")
+        raise RejectedException("Service rejected")
 
-    @dbus.service.method(AGENT_IFACE, in_signature="", out_signature="")
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='', out_signature='')
     def Cancel(self):
-        logger.info("Cancel")
+        """
+        Cancel the agent operation.
+        """
+        logger.info("Agent operation canceled")
+        pass
 
 
-class CharacteristicUserDescriptionDescriptor(Descriptor):
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='s', out_signature='')
+    def Register(self, path):
+        """
+        Register the agent.
+        """
+        logger.info("Agent registered")
+        pass
+
+    @dbus.service.method(GATT_AGENT_IFACE, in_signature='', out_signature='')
+    def Unregister(self):
+        """
+        Unregister the agent.
+        """
+        logger.info("Agent unregistered")
+        pass
+
+
+class CUDDiscriptor(Descriptor):
     """
-    Writable CUD descriptor.
+    Custom descriptor class for CUD (Client Characteristic Configuration Descriptor).
     """
     CUD_UUID = '2901'
-
+    CUD_FLAGS = ['read', 'write']
     def __init__(self, bus, index, characteristic):
-        self.writable = 'writable-auxiliaries' in characteristic.flags
-        self.value = array.array('B', b'Registers characteristic user description (CUD) descriptors for the application')
-        self.value = self.value.tolist()
-        Descriptor.__init__(
-                self, bus, index,
-                self.CUD_UUID,
-                ['read', 'write'],
-                characteristic)
+        self.writable = 'write' in characteristic.flags
+        self.readable = 'read' in characteristic.flags
+
+        if not self.writable and not self.readable:
+            raise NotSupportedException("CUD descriptor must be writable or readable")
+        self.value = array.array('B', b'Registers CUD for application')
+        self.value = self.value.tolist() 
+        super().__init__(bus, index, self.CUD_UUID, self.CUD_FLAGS, characteristic)
+        
 
     def ReadValue(self, options):
+        """
+        Read the value of the CUD descriptor.
+        """
+        if not self.readable:
+            raise NotSupportedException("CUD descriptor not readable")
+        logger.info("CUD descriptor read")
         return self.value
+    
 
     def WriteValue(self, value, options):
+        """
+        Write a value to the CUD descriptor.
+        """
         if not self.writable:
-            raise NotPermittedException()
+            raise NotSupportedException("CUD descriptor not writable")
+        if len(value) != 2:
+            raise InvalidValueLengthException("CUD descriptor value length must be 2 bytes")
         self.value = value
+        logger.info(f"CUD descriptor written: {self.value}")
+
+
+class Advertisement(dbus.service.Object):
+    """
+    GATT Advertisement class that represents a GATT advertisement.
+    """
+
+    PATH_BASE = '/org/bluez/ble/advertisement/'
+
+
+    def __init__(self, bus, index, advertisement_type, mainloop):
+        self.path = self.PATH_BASE + str(index)
+        self.bus = bus
+        self.mainloop = mainloop
+        self.advertisement_type = advertisement_type
+        self.service_uuids = None
+        self.manufacturer_data = None
+        self.service_data = None
+        self.local_name = None
+        self.include_tx_power = False
+        self.solicit_uuids = None
+        self.data = None
+        self.adapter = self.find_adapter()
+        if self.adapter is None:
+            raise NotFoundException("Adapter not found")
+        self.adapter_obj = self.bus.get_object(BLUEZ_SERVICE_NAME, self.adapter)
+        self.adapter_props = dbus.Interface(self.adapter_obj, DBUS_PROPERTIES_IFACE)
+        dbus.service.Object.__init__(self, bus, self.path)
+
+    def get_path(self):
+        """
+        Get the path of the advertisement.
+        """
+        return dbus.ObjectPath(self.path)
     
+    def add_service_uuid(self, uuid):
+        """
+        Add a service UUID to the advertisement.
+        """
+        if self.service_uuids is None:
+            self.service_uuids = []
+        self.service_uuids.append(uuid)
+
+    def add_solicit_uuid(self, uuid):
+        """
+        Add a solicit UUID to the advertisement.
+        """
+        if self.solicit_uuids is None:
+            self.solicit_uuids = []
+        self.solicit_uuids.append(uuid)
+
+    def add_manufacturer_data(self, manufacturer_id, data):
+        """
+        Add manufacturer data to the advertisement.
+        """
+        if self.manufacturer_data is None:
+            self.manufacturer_data = dbus.Dictionary({}, signature='qv')
+        if not isinstance(manufacturer_id, int):
+            raise InvalidArgsException("Manufacturer ID must be an integer")
+        if not isinstance(data, (str, bytes)):
+            raise InvalidArgsException("Data must be a string or bytes")
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if isinstance(data, bytes):
+            data = array.array('B', data).tolist()
+        if len(data) > 31:
+            raise InvalidValueLengthException("Data length must be less than or equal to 31 bytes")
+        self.manufacturer_data[manufacturer_id] = dbus.Array(data, signature='y')
+        logger.info(f"Manufacturer data added: {manufacturer_id} - {data}")
+
+
+    def add_service_data(self, uuid, data):
+        """
+        Add service data to the advertisement.
+        """
+        if self.service_data is None:
+            self.service_data = dbus.Dictionary({}, signature='sv')
+        if not isinstance(uuid, str):
+            raise InvalidArgsException("UUID must be a string")
+        if not isinstance(data, (str, bytes)):
+            raise InvalidArgsException("Data must be a string or bytes")
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if isinstance(data, bytes):
+            data = array.array('B', data).tolist()
+        if len(data) > 31:
+            raise InvalidValueLengthException("Data length must be less than or equal to 31 bytes")
+        self.service_data[uuid] = dbus.Array(data, signature='y')
+
+    def add_local_name(self, name):
+        """
+        Add a local name to the advertisement.
+        """
+        if not isinstance(name, str):
+            raise InvalidArgsException("Name must be a string")
+        if len(name) > 29:
+            raise InvalidValueLengthException("Name length must be less than or equal to 29 characters")
+        self.local_name = dbus.String(name)
+        logger.info(f"Local name added: {name}")
+
+    def add_data(self, data):
+        """
+        Add data to the advertisement.
+        """
+        if not isinstance(data, (str, bytes)):
+            raise InvalidArgsException("Data must be a string or bytes")
+        if isinstance(data, str):
+            data = data.encode('utf-8')
+        if isinstance(data, bytes):
+            data = array.array('B', data).tolist()
+        if len(data) > 31:
+            raise InvalidValueLengthException("Data length must be less than or equal to 31 bytes")
+        self.data = dbus.Array(data, signature='y')
+        logger.info(f"Data added: {data}")
+
+    
+    def get_properties(self):
+        """
+        Get the properties of the advertisement.
+        """
+        return {
+            GATT_ADVERTISEMENT_IFACE: {
+                'Type': self.advertisement_type,
+                'ServiceUUIDs': dbus.Array(self.service_uuids, signature='s'),
+                'ManufacturerData': self.manufacturer_data,
+                'ServiceData': self.service_data,
+                'LocalName': self.local_name,
+                'IncludeTxPower': dbus.Boolean(self.include_tx_power),
+                'SolicitUUIDs': dbus.Array(self.solicit_uuids, signature='s'),
+                'Data': self.data
+            }
+        }
+    
+    def set_adapter_property(self, name, value):
+        """
+        Set a property of the adapter.
+        """
+        self.adapter_props.Set(GATT_ADAPTER_IFACE, name, value)
+        logger.info(f"Adapter property set: {name} - {value}")
+
+    def get_adapter_properties(self):
+        """
+        Get the properties of the adapter.
+        """
+        return self.adapter_props.GetAll(GATT_ADAPTER_IFACE)
+
+    def get_advertisement_type(self):
+        """
+        Get the advertisement type.
+        """
+        return self.advertisement_type
+    
+    def get_service_uuids(self):
+        """
+        Get the service UUIDs.
+        """
+        return self.service_uuids
+    
+    
+    @dbus.service.method(DBUS_PROPERTIES_IFACE, in_signature='s', out_signature='a{sv}')
+    def GetAll(self, interface):
+        """
+        Get all properties of the advertisement.
+        """
+        if interface != GATT_ADVERTISEMENT_IFACE:
+            raise InvalidArgsException("Invalid interface")
+        return self.get_properties()[GATT_ADVERTISEMENT_IFACE]
+    
+    @dbus.service.method(GATT_ADVERTISEMENT_IFACE, in_signature='', out_signature='')
+    def Release(self):
+        """
+        Release the advertisement.
+        """
+        logger.info("Advertisement released")
+        pass
+
+    def find_adapter(self):
+        """
+        Find the adapter for the advertisement.
+        """
+        rempte_om = dbus.Interface(self.bus.get_object(BLUEZ_SERVICE_NAME, "/"), DBUS_OM_IFACE)
+        objects = rempte_om.GetManagedObjects()
+        adapter = None
+        for path, ifaces in objects.items():
+            if GATT_ADAPTER_IFACE in ifaces:
+                adapter = path
+                break
+        logger.info(f"Adapter found: {adapter}")
+        return adapter
+
+    
+
+    def register_advertisement(self):
+        """
+        Register the advertisement.
+        """
+        logger.info("Registering advertisement")
+        adv_manager = dbus.Interface(self.adapter_obj, GATT_LE_ADVERTISING_MANAGER_IFACE)
+        adv_manager.RegisterAdvertisement(self.path, {}, reply_handler=self.register_success, error_handler=self.register_error)
+        logger.info("Advertisement registered")
+
+    def unregister_advertisement(self):
+        """
+        Unregister the advertisement.
+        """
+        logger.info("Unregistering advertisement")
+        adv_manager = dbus.Interface(bus.get_object(BLUEZ_SERVICE_NAME, BLUEZ_SERVICE_PATH), GATT_LE_ADVERTISING_MANAGER_IFACE)
+        adv_manager.UnregisterAdvertisement(self.path, reply_handler=self.unregister_success, error_handler=self.unregister_error)
+        logger.info("Advertisement unregistered")
+
+    def start_advertisement(self):
+        """
+        Start the advertisement.
+        """
+        self.register_advertisement()
+        logger.info("Advertisement started")
+        
+
+    def stop_advertisement(self):
+        """
+        Stop the advertisement.
+        """
+        self.unregister_advertisement()
+        logger.info("Advertisement stopped")
+        
+
+    def register_error(self, error):
+        """
+        Register an error callback.
+        """
+        logger.error(f"Advertisement registration error: {error}")
+        self.mainloop.quit()
+            
+
+    def register_success(self):
+        """
+        Register a success callback.
+        """
+        logger.info("Advertisement registration successful")
+
+    def unregister_error(self, error):
+        """
+        Unregister an error callback.
+        """
+        logger.error(f"Advertisement unregistration error: {error}")
+        self.mainloop.quit()
+
+    def unregister_success(self):
+        """
+        Unregister a success callback.
+        """
+        logger.info("Advertisement unregistration successful")
+        self.mainloop.quit()
+
